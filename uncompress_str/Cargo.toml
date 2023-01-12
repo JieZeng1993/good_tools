@@ -2,6 +2,7 @@
 name = "uncompress_str"
 version = "0.1.0"
 edition = "2021"
+description="对字符串先进行base64转为字节后，通过gzip解压，最后转为字符串"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
