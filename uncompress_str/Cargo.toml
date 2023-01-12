@@ -8,5 +8,4 @@ description="对字符串先进行base64转为字节后，通过gzip解压，最
 
 [dependencies]
 base64 = "0.21.0"
-miniz_oxide = "0.6.2"
 flate2 = { version = "1.0.17" }
