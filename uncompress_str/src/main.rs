@@ -7,7 +7,8 @@ use flate2::read::GzDecoder;
 fn main() {
     let args: Vec<_> = std::env::args().collect();
     if args.len() < 2 {
-        panic!("没有参数可解压");
+        println!("请传入需要解压的字符串");
+        return;
     }
 
     let need_uncompress_str = &args[1];
