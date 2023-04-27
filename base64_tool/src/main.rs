@@ -3,7 +3,6 @@ use std::io::{Read, Write};
 
 use base64::Engine;
 use base64::engine::general_purpose;
-use flate2::read::GzDecoder;
 
 fn main() {
     let args: Vec<_> = std::env::args().collect();
@@ -14,7 +13,7 @@ fn main() {
 
     if args[1].eq("-d") {
         base64_to_file();
-    } else if args[2].eq("-e") {
+    } else if args[1].eq("-e") {
         file_to_base64();
     } else {
         println!("第一个参数只能是 -e(文件转base64) 或 -d(base64转文件)")
