@@ -1,2 +1,2 @@
 [workspace]
-members = ["uncompress_str"]
+members = ["uncompress_str","base64_tool"]
