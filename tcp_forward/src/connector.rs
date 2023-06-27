@@ -12,12 +12,6 @@ pub struct Args {
     pub(crate) forward: String,
 }
 
-
-pub enum Protocol {
-    Http,
-    Http2,
-}
-
 pub enum Transport {
     Tcp,
     Tls,

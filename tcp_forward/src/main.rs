@@ -1,9 +1,8 @@
 use std::io::{Read, Write};
-use std::net::{IpAddr, TcpListener, TcpStream};
+use std::net::{ TcpListener, TcpStream};
 use std::thread;
 
 use clap::Parser;
-use dns_lookup::lookup_host;
 
 use crate::connector::{Args, Connection};
 

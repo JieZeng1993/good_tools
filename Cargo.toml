@@ -1,2 +1,2 @@
 [workspace]
-members = ["uncompress_str","base64_tool"]
+members = ["uncompress_str","base64_tool","tcp_forward"]
