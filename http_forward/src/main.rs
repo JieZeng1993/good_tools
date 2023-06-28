@@ -2,15 +2,16 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 
 use clap::Parser;
+use futures_util::stream;
 use http_body_util::{BodyExt, Empty, Full, StreamBody};
 use hyper::{Request, Response};
-use hyper::body::{Body, Bytes};
+use hyper::body::{Body, Bytes, Frame};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use tokio::io;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
-
+use futures_util::StreamExt;
 use crate::connector::{Args, Connection};
 
 mod connector;
@@ -79,10 +80,13 @@ async fn hello(request: Request<hyper::body::Incoming>) -> Result<Response<Full<
     let authority = url.authority().unwrap().clone();
 
     let mut req_builder = Request::builder()
-        .uri(url)
-        .header(hyper::header::HOST, authority.as_str());
+        .uri(url);
     for (header_name, header_value) in header {
-        req_builder.headers_mut().map(|req_builder1| req_builder1.append(header_name, header_value.clone()));
+        if(header_name.eq("host")){
+            req_builder.headers_mut().map(|req_builder1| req_builder1.append(header_name, "idea.lanyus.com".to_string().parse().unwrap()));
+        }else {
+            req_builder.headers_mut().map(|req_builder1| req_builder1.append(header_name, header_value.clone()));
+        }
     }
 
     // // Protect our server from massive bodies.
@@ -99,12 +103,15 @@ async fn hello(request: Request<hyper::body::Incoming>) -> Result<Response<Full<
     //     .cloned()
     //     .collect::<Vec<u8>>();
 
-    let req = req_builder.body(request.into_body());
+
+    let req = req_builder.body(Empty::<Bytes>::new());
     if req.is_err() {
         return Ok(Response::new(Full::new(Bytes::from("assert req error"))));
     }
+
     let req = req.unwrap();
 
+    println!("req Headers: {:#?}\n", req.headers());
     let res = sender.send_request(req).await;
     if res.is_err() {
         return Ok(Response::new(Full::new(Bytes::from("request error"))));
@@ -112,32 +119,29 @@ async fn hello(request: Request<hyper::body::Incoming>) -> Result<Response<Full<
     let mut res = res.unwrap();
 
     println!("Response: {}", res.status());
-    println!("Headers: {:#?}\n", res.headers());
+    println!("res Headers: {:#?}\n", res.headers());
+
 
     // Stream the body, writing each chunk to stdout as we get it
     // (instead of buffering and printing at the end).
-    let chunks: Vec<Result<_, Infallible>> = vec![]
+    let mut chunks= vec![];
     while let Some(next) = res.frame().await {
         if next.is_err() {
             return Ok(Response::new(Full::new(Bytes::from("read frame error"))));
         }
         let frame = next.unwrap();
         if let Some(chunk) = frame.data_ref() {
+            chunks.push(chunk.clone());
             io::stdout().write_all(&chunk).await.expect("TODO: panic message");
         }
     }
 
-    println!("\n\nDone!");
 
-    let chunks: Vec<Result<_, Infallible>> = vec![
-        Ok(Frame::data(Bytes::from(vec![1]))),
-        Ok(Frame::data(Bytes::from(vec![2]))),
-        Ok(Frame::data(Bytes::from(vec![3]))),
-    ];
-    let stream = futures_util::stream::iter(chunks);
-    let mut body = StreamBody::new(res.frame());
+    let body = StreamBody::new(stream::iter(chunks.into_iter().map(Frame::data).map(Ok::<_, Infallible>)));
 
+    let buffered = BodyExt::collect(body).await.unwrap();
 
+    let buf = buffered.to_bytes();
 
-    Ok(Response::new(Full::new(Bytes::from("Hello, World!"))))
+    Ok(Response::new(Full::new(buf)))
 }
