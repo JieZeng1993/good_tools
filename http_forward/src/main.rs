@@ -12,6 +12,7 @@ use tokio::io;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use futures_util::StreamExt;
+use hyper::header::HeaderValue;
 use crate::connector::{Args, Connection};
 
 mod connector;
@@ -83,7 +84,7 @@ async fn hello(request: Request<hyper::body::Incoming>) -> Result<Response<Full<
         .uri(url);
     for (header_name, header_value) in header {
         if(header_name.eq("host")){
-            req_builder.headers_mut().map(|req_builder1| req_builder1.append(header_name, "idea.lanyus.com".to_string().parse().unwrap()));
+            req_builder.headers_mut().map(|req_builder1| req_builder1.append(header_name, authority.to_string().parse().unwrap()));
         }else {
             req_builder.headers_mut().map(|req_builder1| req_builder1.append(header_name, header_value.clone()));
         }
