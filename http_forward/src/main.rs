@@ -1,7 +1,7 @@
 use std::convert::Infallible;
 
 use clap::Parser;
-use http::{HeaderMap, HeaderValue};
+use http::HeaderValue;
 use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response};
 use hyper::body::Bytes;
@@ -75,6 +75,7 @@ async fn forward(mut from_req: Request<hyper::body::Incoming>, forward_to: Strin
         }
     });
     let forward_addr = format!("{}:{}", forward_host, forward_port);
+
     let forward_stream = TcpStream::connect(forward_addr).await;
     if forward_stream.is_err() {
         return Ok(Response::new(Full::new(Bytes::from("forward connect error"))));
