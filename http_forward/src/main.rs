@@ -1,18 +1,16 @@
 use std::convert::Infallible;
-use std::net::SocketAddr;
 
 use clap::Parser;
-use futures_util::stream;
-use http_body_util::{BodyExt, Empty, Full, StreamBody};
+use http::{HeaderMap, HeaderValue};
+use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response};
-use hyper::body::{Body, Bytes, Frame};
+use hyper::body::Bytes;
+use hyper::http::uri::Scheme;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use tokio::io;
-use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
-use futures_util::StreamExt;
-use hyper::header::HeaderValue;
+use uuid::Uuid;
+
 use crate::connector::{Args, Connection};
 
 mod connector;
@@ -26,123 +24,152 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let f_conn = connector::parse_args(&args.forward);
     Connection::display(&f_conn);
 
-    // We create a TcpListener and bind it to 127.0.0.1:3000
+    // 开启本地代理的监听
     let listener = TcpListener::bind((l_conn.host, l_conn.port)).await?;
 
-    // We start a loop to continuously accept incoming connections
+    // 循环接收请求
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, socket_addr) = listener.accept().await?;
+        let forward_to = args.forward.clone();
 
-        // Spawn a tokio task to serve multiple connections concurrently
+        // 新增一个tokio线程，处理当前连接
         tokio::task::spawn(async move {
-            // Finally, we bind the incoming connection to our `hello` service
+            let trace_id = Uuid::new_v4().to_string();
+            println!("[{}]start deal connect {}", trace_id, socket_addr);
+
+            // 组装为http请求，使用forward方法处理
             if let Err(err) = http1::Builder::new()
-                // `service_fn` converts our function in a `Service`
-                .serve_connection(stream, service_fn(hello))
+                // service_fn 使用 forward 方法处理每一次请求
+                .serve_connection(stream, service_fn(|req: Request<hyper::body::Incoming>| async {
+                    forward(req, forward_to.clone(), trace_id.clone()).await
+                }))
                 .await
             {
-                println!("Error serving connection: {:?}", err);
+                println!("[{}]connect {} deal fail: {:?}", trace_id.clone(), socket_addr, err);
             }
+            println!("[{}]finish deal connect {}", trace_id, socket_addr);
         });
     }
 }
 
-async fn hello(request: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
-    let uri = request.uri();
-    let header = request.headers();
+async fn forward(mut from_req: Request<hyper::body::Incoming>, forward_to: String, trace_id: String) -> Result<Response<Full<Bytes>>, Infallible> {
+    let from_uri = from_req.uri();
+    let from_req_header = from_req.headers();
 
-
-    let mut url = "http://idea.lanyus.com/".to_owned() + uri.path();
-    if uri.query().is_some() {
-        url += &*("?".to_owned() + uri.query().unwrap());
+    let mut forward_url = forward_to + from_uri.path();
+    if from_uri.query().is_some() {
+        forward_url += &*("?".to_owned() + from_uri.query().unwrap());
     }
-    let url = url.parse::<hyper::Uri>().unwrap();
+    let forward_url = forward_url.parse::<hyper::Uri>().unwrap();
+    println!("[{}]redirect method:{} url:{}", trace_id, from_req.method(), forward_url);
 
-    let host = url.host().expect("uri has no host");
-    let port = url.port_u16().unwrap_or(80);
-    let addr = format!("{}:{}", host, port);
-    let stream = TcpStream::connect(addr).await;
-    if stream.is_err() {
-        return Ok(Response::new(Full::new(Bytes::from("connect error"))));
-    }
-    let stream = stream.unwrap();
-
-    let handshake = hyper::client::conn::http1::handshake(stream).await;
-    if handshake.is_err() {
-        return Ok(Response::new(Full::new(Bytes::from("handshake error"))));
-    }
-    let (mut sender, conn) = handshake.unwrap();
-    tokio::task::spawn(async move {
-        if let Err(err) = conn.await {
-            println!("Connection failed: {:?}", err);
+    let forward_host = forward_url.host().expect("url has no host");
+    let forward_port = forward_url.port_u16().unwrap_or_else(|| {
+        let scheme = forward_url.scheme().unwrap();
+        if scheme.eq(&Scheme::HTTP) {
+            80
+        } else if scheme.eq(&Scheme::HTTPS) {
+            443
+        } else {
+            panic!("not support schema：{}", scheme)
         }
     });
+    let forward_addr = format!("{}:{}", forward_host, forward_port);
+    let forward_stream = TcpStream::connect(forward_addr).await;
+    if forward_stream.is_err() {
+        return Ok(Response::new(Full::new(Bytes::from("forward connect error"))));
+    }
+    let forward_stream = forward_stream.unwrap();
 
-    let authority = url.authority().unwrap().clone();
+    let forward_handshake = hyper::client::conn::http1::handshake(forward_stream).await;
+    if forward_handshake.is_err() {
+        return Ok(Response::new(Full::new(Bytes::from("forward handshake error"))));
+    }
+    let (mut forward_sender, forward_conn) = forward_handshake.unwrap();
+    let trace_id_clone = trace_id.clone();
+    tokio::task::spawn(async move {
+        if let Err(err) = forward_conn.await {
+            println!("[{}]forward connect fail: {:?}", trace_id_clone, err);
+        }
+        println!("[{}]forward connect finish", trace_id_clone);
+    });
 
-    let mut req_builder = Request::builder()
-        .uri(url);
-    for (header_name, header_value) in header {
-        if(header_name.eq("host")){
-            req_builder.headers_mut().map(|req_builder1| req_builder1.append(header_name, authority.to_string().parse().unwrap()));
-        }else {
-            req_builder.headers_mut().map(|req_builder1| req_builder1.append(header_name, header_value.clone()));
+    let authority = forward_url.authority().unwrap().clone();
+
+    let mut forward_req_builder = Request::builder()
+        .uri(forward_url).method(from_req.method());
+    let mut forward_req_headers = forward_req_builder.headers_mut().unwrap();
+    for (header_name, header_value) in from_req_header {
+        if header_name.eq(&http::header::HOST) {
+            //deal cross error
+            forward_req_headers.append(header_name, HeaderValue::try_from(authority.to_string()).unwrap());
+        } else {
+            forward_req_headers.append(header_name, header_value.clone());
         }
     }
 
-    // // Protect our server from massive bodies.
-    // let upper = request.body().size_hint().upper().unwrap_or(u64::MAX);
-    // if upper > 1024 * 64 {
-    //     return Ok(Response::new(Full::new(Bytes::from("Body too big"))));
-    // }
-    //
-    // // Await the whole body to be collected into a single `Bytes`...
-    // let whole_body = request.collect().await.unwrap().to_bytes();
-    // // Iterate the whole body in reverse order and collect into a new Vec.
-    // let reversed_body = whole_body.iter()
-    //     .rev()
-    //     .cloned()
-    //     .collect::<Vec<u8>>();
+    let mut from_req_body = from_req.into_body();
+    let mut from_req_body_vec = vec![];
+    while let Some(next) = from_req_body.frame().await {
+        if next.is_err() {
+            return Ok(Response::new(Full::new(Bytes::from("read from frame error"))));
+        }
+        let frame = next.unwrap();
+        if let chunk = frame.into_data() {
+            let mut frame = chunk.unwrap();
+            from_req_body_vec.append(&mut frame.to_vec())
+        }
+    }
+    println!("[{}]from request body: {}", trace_id, std::str::from_utf8(&from_req_body_vec).unwrap());
 
+    let forward_req = forward_req_builder.body(Full::new(Bytes::from(from_req_body_vec)));
 
-    let req = req_builder.body(Empty::<Bytes>::new());
-    if req.is_err() {
+    if forward_req.is_err() {
         return Ok(Response::new(Full::new(Bytes::from("assert req error"))));
     }
 
-    let req = req.unwrap();
+    let forward_req = forward_req.unwrap();
 
-    println!("req Headers: {:#?}\n", req.headers());
-    let res = sender.send_request(req).await;
-    if res.is_err() {
-        return Ok(Response::new(Full::new(Bytes::from("request error"))));
+    println!("[{}]forward request Headers: {:#?}", trace_id, forward_req.headers());
+    let forward_resp = forward_sender.send_request(forward_req).await;
+    if forward_resp.is_err() {
+        return Ok(Response::new(Full::new(Bytes::from("forward request error"))));
     }
-    let mut res = res.unwrap();
+    let mut forward_resp = forward_resp.unwrap();
 
-    println!("Response: {}", res.status());
-    println!("res Headers: {:#?}\n", res.headers());
+    println!("[{}]forward response status: {}", trace_id, forward_resp.status());
+    let forward_resp_headers = forward_resp.headers();
+    println!("[{}]forward response Headers: {:#?}", trace_id, forward_resp_headers);
+    let mut from_resp_builder = Response::builder();
+    let mut forward_content_type = String::new();
+    for (header_name, header_value) in forward_resp_headers {
+        if header_name.eq(&http::header::CONTENT_TYPE) {
+            forward_content_type = header_value.to_str().unwrap().to_string();
+        }
+        from_resp_builder.headers_mut().map(|resp_builder1| resp_builder1.append(header_name, header_value.clone()));
+    }
 
-
-    // Stream the body, writing each chunk to stdout as we get it
-    // (instead of buffering and printing at the end).
-    let mut chunks= vec![];
-    while let Some(next) = res.frame().await {
+    let mut from_resp_body_vec = vec![];
+    let mut forward_resp_body = forward_resp.into_body();
+    while let Some(next) = forward_resp_body.frame().await {
         if next.is_err() {
-            return Ok(Response::new(Full::new(Bytes::from("read frame error"))));
+            return Ok(Response::new(Full::new(Bytes::from("read forward frame error"))));
         }
         let frame = next.unwrap();
-        if let Some(chunk) = frame.data_ref() {
-            chunks.push(chunk.clone());
-            io::stdout().write_all(&chunk).await.expect("TODO: panic message");
+        if let chunk = frame.into_data() {
+            let mut frame = chunk.unwrap();
+            from_resp_body_vec.append(&mut frame.to_vec())
+        }
+    }
+    if forward_content_type.starts_with("image") {
+        println!("[{}]response body type: {}", trace_id, forward_content_type);
+    } else {
+        if from_resp_body_vec.is_empty() {
+            println!("[{}]response body is empty", trace_id);
+        } else {
+            println!("[{}]response body: {}", trace_id, std::str::from_utf8(&from_resp_body_vec).unwrap());
         }
     }
 
-
-    let body = StreamBody::new(stream::iter(chunks.into_iter().map(Frame::data).map(Ok::<_, Infallible>)));
-
-    let buffered = BodyExt::collect(body).await.unwrap();
-
-    let buf = buffered.to_bytes();
-
-    Ok(Response::new(Full::new(buf)))
+    Ok(from_resp_builder.body(Full::new(Bytes::from(from_resp_body_vec))).unwrap())
 }

@@ -8,6 +8,8 @@ edition = "2021"
 [dependencies]
 clap = { version = "*", features = ["derive"] }
 hyper = { version = "1.0.0-rc.3", features = ["full"] }
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "*", features = ["full"] }
 http-body-util = "0.1.0-rc.2"
 futures-util = "*"
+uuid = { version = "*", features = ["v4", "fast-rng", "macro-diagnostics", ] }
+http = "*"
