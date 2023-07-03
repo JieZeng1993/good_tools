@@ -1,7 +1,7 @@
 use std::convert::Infallible;
 
 use clap::Parser;
-use http::HeaderValue;
+use http::{HeaderMap, HeaderValue, Method, Uri};
 use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response};
 use hyper::body::Bytes;
@@ -41,7 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             if let Err(err) = http1::Builder::new()
                 // service_fn 使用 forward 方法处理每一次请求
                 .serve_connection(stream, service_fn(|req: Request<hyper::body::Incoming>| async {
-                    forward(req, forward_to.clone(), trace_id.clone()).await
+                    forward(req, &forward_to, &trace_id).await
                 }))
                 .await
             {
@@ -52,35 +52,120 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 }
 
-async fn forward(mut from_req: Request<hyper::body::Incoming>, forward_to: String, trace_id: String) -> Result<Response<Full<Bytes>>, Infallible> {
+async fn forward(mut from_req: Request<hyper::body::Incoming>, forward_to: &str, trace_id: &str) -> Result<Response<Full<Bytes>>, Infallible> {
     //解析请求
     println!("[{}]origin:{}, method:{}", trace_id, from_req.uri(), from_req.method());
 
-    let mut from_req_body_vec = vec![];
-    let from_req_body = from_req.body_mut();
-    while let Some(next) = from_req_body.frame().await {
-        if next.is_err() {
-            return Ok(Response::new(Full::new(Bytes::from("read from frame error"))));
-        }
-        let frame = next.unwrap();
-        if let Ok(chunk) = frame.into_data() {
-            from_req_body_vec.append(&mut chunk.to_vec())
-        } else {
-            return Ok(Response::new(Full::new(Bytes::from("read data from frame error"))));
-        }
+    let from_req_body_vec = read_body_data(from_req.body_mut(), trace_id, "reqBody", None).await;
+    if from_req_body_vec.is_err() {
+        return Ok(Response::new(Full::new(Bytes::from(from_req_body_vec.unwrap_err()))));
     }
-    println!("[{}]from request body: {}", trace_id, std::str::from_utf8(&from_req_body_vec).unwrap());
-
+    let from_req_body_vec = from_req_body_vec.unwrap();
     let from_req_header = from_req.headers();
 
-    let from_uri = from_req.uri();
+    let (forward_addr, forward_url) = get_forward_addr(from_req.uri(), forward_to, trace_id);
+
+    //发起请求
+    let forward_stream = TcpStream::connect(forward_addr).await;
+    if forward_stream.is_err() {
+        println!("[{trace_id}]forward connect error");
+        return Ok(Response::new(Full::new(Bytes::from("forward connect error"))));
+    }
+    let forward_stream = forward_stream.unwrap();
+
+    let forward_handshake = hyper::client::conn::http1::handshake(forward_stream).await;
+    if forward_handshake.is_err() {
+        println!("[{trace_id}]forward handshake error");
+        return Ok(Response::new(Full::new(Bytes::from("forward handshake error"))));
+    }
+    let (mut forward_sender, forward_conn) = forward_handshake.unwrap();
+    let trace_id_clone = trace_id.to_string();
+    tokio::task::spawn(async move {
+        if let Err(err) = forward_conn.await {
+            println!("[{trace_id_clone}]forward connect fail: {:?}", err);
+        }
+        println!("[{trace_id_clone}]forward connect finish");
+    });
+
+    let forward_req = assemble_redirect_req(forward_url, from_req.method(), from_req_body_vec, from_req_header, trace_id);
+    if forward_req.is_err() {
+        return Ok(Response::new(Full::new(Bytes::from(forward_req.unwrap_err()))));
+    }
+    let forward_req = forward_req.unwrap();
+
+    //解析转发后的响应
+    println!("[{trace_id}]forward request Headers: {:#?}", forward_req.headers());
+    let forward_resp = forward_sender.send_request(forward_req).await;
+    if forward_resp.is_err() {
+        return Ok(Response::new(Full::new(Bytes::from("forward request error"))));
+    }
+    let mut forward_resp = forward_resp.unwrap();
+
+    let forward_resp_headers = forward_resp.headers();
+    println!("[{trace_id}]forward response status:{} Headers: {:#?}", forward_resp.status(), forward_resp_headers);
+    let mut from_resp_builder = Response::builder();
+    let mut forward_content_type = String::new();
+    for (header_name, header_value) in forward_resp_headers {
+        if header_name.eq(&http::header::CONTENT_TYPE) {
+            forward_content_type = header_value.to_str().unwrap().to_string();
+        }
+        from_resp_builder.headers_mut().map(|resp_builder1| resp_builder1.append(header_name, header_value.clone()));
+    }
+
+    let forward_resp_body_vec = read_body_data(forward_resp.body_mut(), trace_id, "respBody", Some(&forward_content_type)).await;
+    if forward_resp_body_vec.is_err() {
+        return Ok(Response::new(Full::new(Bytes::from(forward_resp_body_vec.unwrap_err()))));
+    }
+    let forward_resp_body_vec = forward_resp_body_vec.unwrap();
+
+    Ok(from_resp_builder.body(Full::new(Bytes::from(forward_resp_body_vec))).unwrap())
+}
+
+///将body 转换为字节
+async fn read_body_data(body: &mut hyper::body::Incoming, trace_id: &str, source: &str, content_type: Option<&str>) -> Result<Vec<u8>, String> {
+    let mut body_vec = vec![];
+    loop {
+        let frame = body.frame().await;
+        if frame.is_none() {
+            break;
+        }
+        let frame = frame.unwrap();
+        if frame.is_err() {
+            let err_msg = format!("read from {} error", source);
+            println!("[{}]{}, {:?}", trace_id, err_msg, frame.unwrap_err());
+            return Err(err_msg);
+        }
+        let frame = frame.unwrap().into_data();
+        if frame.is_err() {
+            let err_msg = format!("read data from {} error", source);
+            println!("[{}]{}, {:?}", trace_id, err_msg, frame.unwrap_err());
+            return Err(err_msg);
+        }
+        body_vec.append(&mut frame.unwrap().to_vec())
+    }
+
+    if content_type.is_some() && content_type.unwrap().starts_with("image") {
+        println!("[{trace_id}]{source} body type: {}", content_type.unwrap());
+    } else {
+        if body_vec.is_empty() {
+            println!("[{trace_id}]{source} body is empty");
+        } else {
+            println!("[{trace_id}]{source} body: {}", std::str::from_utf8(&body_vec).unwrap());
+        }
+    }
+
+    Ok(body_vec)
+}
+
+///获取转发的addr以及url
+fn get_forward_addr(from_uri: &Uri, forward_to: &str, trace_id: &str) -> (String, Uri) {
     let forward_url;
     if from_uri.query().is_none() {
-        forward_url = forward_to + from_uri.path();
+        forward_url = format!("{}{}", forward_to, from_uri.path());
     } else {
         forward_url = format!("{}{}?{}", forward_to, from_uri.path(), from_uri.query().unwrap());
     }
-    let forward_url = forward_url.parse::<hyper::Uri>().unwrap();
+    let forward_url = forward_url.parse::<Uri>().unwrap();
     println!("[{}]redirect url:{}", trace_id, forward_url);
 
     let forward_host = forward_url.host().expect("url has no host");
@@ -94,32 +179,15 @@ async fn forward(mut from_req: Request<hyper::body::Incoming>, forward_to: Strin
             panic!("not support schema：{}", scheme)
         }
     });
-    let forward_addr = format!("{}:{}", forward_host, forward_port);
+    (format!("{}:{}", forward_host, forward_port), forward_url)
+}
 
-    //发起请求
-    let forward_stream = TcpStream::connect(forward_addr).await;
-    if forward_stream.is_err() {
-        return Ok(Response::new(Full::new(Bytes::from("forward connect error"))));
-    }
-    let forward_stream = forward_stream.unwrap();
-
-    let forward_handshake = hyper::client::conn::http1::handshake(forward_stream).await;
-    if forward_handshake.is_err() {
-        return Ok(Response::new(Full::new(Bytes::from("forward handshake error"))));
-    }
-    let (mut forward_sender, forward_conn) = forward_handshake.unwrap();
-    let trace_id_clone = trace_id.clone();
-    tokio::task::spawn(async move {
-        if let Err(err) = forward_conn.await {
-            println!("[{}]forward connect fail: {:?}", trace_id_clone, err);
-        }
-        println!("[{}]forward connect finish", trace_id_clone);
-    });
-
+///组装请求
+fn assemble_redirect_req(forward_url: Uri, method: &Method, from_req_body_vec: Vec<u8>, from_req_header: &HeaderMap, trace_id: &str) -> Result<Request<Full<Bytes>>, String> {
     let authority = forward_url.authority().unwrap().clone();
 
     let mut forward_req_builder = Request::builder()
-        .uri(forward_url).method(from_req.method());
+        .uri(forward_url).method(method);
     let forward_req_headers = forward_req_builder.headers_mut().unwrap();
     for (header_name, header_value) in from_req_header {
         if header_name.eq(&http::header::HOST) {
@@ -132,52 +200,9 @@ async fn forward(mut from_req: Request<hyper::body::Incoming>, forward_to: Strin
 
     let forward_req = forward_req_builder.body(Full::new(Bytes::from(from_req_body_vec)));
     if forward_req.is_err() {
-        return Ok(Response::new(Full::new(Bytes::from("assert req error"))));
+        let err_msg = format!("assert req error");
+        println!("[{trace_id}]{err_msg}");
+        return Err(err_msg);
     }
-    let forward_req = forward_req.unwrap();
-
-    //解析转发后的响应
-    println!("[{}]forward request Headers: {:#?}", trace_id, forward_req.headers());
-    let forward_resp = forward_sender.send_request(forward_req).await;
-    if forward_resp.is_err() {
-        return Ok(Response::new(Full::new(Bytes::from("forward request error"))));
-    }
-    let forward_resp = forward_resp.unwrap();
-
-    println!("[{}]forward response status: {}", trace_id, forward_resp.status());
-    let forward_resp_headers = forward_resp.headers();
-    println!("[{}]forward response Headers: {:#?}", trace_id, forward_resp_headers);
-    let mut from_resp_builder = Response::builder();
-    let mut forward_content_type = String::new();
-    for (header_name, header_value) in forward_resp_headers {
-        if header_name.eq(&http::header::CONTENT_TYPE) {
-            forward_content_type = header_value.to_str().unwrap().to_string();
-        }
-        from_resp_builder.headers_mut().map(|resp_builder1| resp_builder1.append(header_name, header_value.clone()));
-    }
-
-    let mut from_resp_body_vec = vec![];
-    let mut forward_resp_body = forward_resp.into_body();
-    while let Some(next) = forward_resp_body.frame().await {
-        if next.is_err() {
-            return Ok(Response::new(Full::new(Bytes::from("read from forward frame error"))));
-        }
-        let frame = next.unwrap();
-        if let Ok(chunk) = frame.into_data() {
-            from_resp_body_vec.append(&mut chunk.to_vec())
-        } else {
-            return Ok(Response::new(Full::new(Bytes::from("read data from forward frame error"))));
-        }
-    }
-    if forward_content_type.starts_with("image") {
-        println!("[{}]response body type: {}", trace_id, forward_content_type);
-    } else {
-        if from_resp_body_vec.is_empty() {
-            println!("[{}]response body is empty", trace_id);
-        } else {
-            println!("[{}]response body: {}", trace_id, std::str::from_utf8(&from_resp_body_vec).unwrap());
-        }
-    }
-
-    Ok(from_resp_builder.body(Full::new(Bytes::from(from_resp_body_vec))).unwrap())
+    Ok(forward_req.unwrap())
 }
