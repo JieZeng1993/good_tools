@@ -1,4 +1,4 @@
 tcp请求转发工具
 
 本地运行指定参数
--- -L http://127.0.0.1:8888 -F http://idea.lanyus.com
+-- -L http://127.0.0.1:8888 -F http://a.com
