@@ -57,15 +57,16 @@ async fn forward(mut from_req: Request<hyper::body::Incoming>, forward_to: Strin
     println!("[{}]origin:{}, method:{}", trace_id, from_req.uri(), from_req.method());
 
     let mut from_req_body_vec = vec![];
-    let mut from_req_body = from_req.body_mut();
+    let from_req_body = from_req.body_mut();
     while let Some(next) = from_req_body.frame().await {
         if next.is_err() {
             return Ok(Response::new(Full::new(Bytes::from("read from frame error"))));
         }
         let frame = next.unwrap();
-        if let chunk = frame.into_data() {
-            let mut frame = chunk.unwrap();
-            from_req_body_vec.append(&mut frame.to_vec())
+        if let Ok(chunk) = frame.into_data() {
+            from_req_body_vec.append(&mut chunk.to_vec())
+        } else {
+            return Ok(Response::new(Full::new(Bytes::from("read data from frame error"))));
         }
     }
     println!("[{}]from request body: {}", trace_id, std::str::from_utf8(&from_req_body_vec).unwrap());
@@ -119,7 +120,7 @@ async fn forward(mut from_req: Request<hyper::body::Incoming>, forward_to: Strin
 
     let mut forward_req_builder = Request::builder()
         .uri(forward_url).method(from_req.method());
-    let mut forward_req_headers = forward_req_builder.headers_mut().unwrap();
+    let forward_req_headers = forward_req_builder.headers_mut().unwrap();
     for (header_name, header_value) in from_req_header {
         if header_name.eq(&http::header::HOST) {
             //deal cross error
@@ -141,7 +142,7 @@ async fn forward(mut from_req: Request<hyper::body::Incoming>, forward_to: Strin
     if forward_resp.is_err() {
         return Ok(Response::new(Full::new(Bytes::from("forward request error"))));
     }
-    let mut forward_resp = forward_resp.unwrap();
+    let forward_resp = forward_resp.unwrap();
 
     println!("[{}]forward response status: {}", trace_id, forward_resp.status());
     let forward_resp_headers = forward_resp.headers();
@@ -159,12 +160,13 @@ async fn forward(mut from_req: Request<hyper::body::Incoming>, forward_to: Strin
     let mut forward_resp_body = forward_resp.into_body();
     while let Some(next) = forward_resp_body.frame().await {
         if next.is_err() {
-            return Ok(Response::new(Full::new(Bytes::from("read forward frame error"))));
+            return Ok(Response::new(Full::new(Bytes::from("read from forward frame error"))));
         }
         let frame = next.unwrap();
-        if let chunk = frame.into_data() {
-            let mut frame = chunk.unwrap();
-            from_resp_body_vec.append(&mut frame.to_vec())
+        if let Ok(chunk) = frame.into_data() {
+            from_resp_body_vec.append(&mut chunk.to_vec())
+        } else {
+            return Ok(Response::new(Full::new(Bytes::from("read data from forward frame error"))));
         }
     }
     if forward_content_type.starts_with("image") {
